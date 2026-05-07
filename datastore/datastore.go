@@ -11,9 +11,10 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 )
 
-const DefaultVNodes = 1
+const DefaultVNodes = 100 // Increase for larger dataset sizes
 
 // --- Types ---
 
@@ -96,7 +97,13 @@ func Make(nodeID int, peers []string, dataPath string, vnodes int) *DataStore {
 	rightNeighbor := (nodeID + 1) % len(peers)
 	args := ReceiveReplicaArgs{Rows: ds.primaryShard}
 	reply := ReceiveReplicaReply{}
-	call(peers[rightNeighbor], "DataStore.ReceiveReplica", &args, &reply)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if call(peers[rightNeighbor], "DataStore.ReceiveReplica", &args, &reply) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	return ds
 }
@@ -105,19 +112,38 @@ func Make(nodeID int, peers []string, dataPath string, vnodes int) *DataStore {
 
 // buildRing constructs the sorted virtual-node ring; call once during Make.
 func (ds *DataStore) buildRing() []RingEntry {
-	// TODO: for each physical node 0..len(peers)-1 and each vnode index 0..vnodes-1,
-	// hash the key fmt.Sprintf("%d-%d", nodeID, v) and append RingEntry{pos, nodeID}.
-	// Sort the result by pos before returning.
-	return nil
+	ring := make([]RingEntry, 0)
+
+	for peer := range ds.peers {
+		for vnode := range ds.vnodes {
+			entry := RingEntry{pos: fnv32(fmt.Sprintf("%d-%d", peer, vnode)), nodeID: peer}
+			ring = append(ring, entry)
+		}
+	}
+	sort.Slice(ring, func(i, j int) bool {
+		return ring[i].pos < ring[j].pos
+	})
+	
+	return ring
 }
 
 // ownerOf returns the physical node responsible for the given row index.
 func (ds *DataStore) ownerOf(rowIndex int) int {
-	// TODO: compute rowPos = fnv32(strconv.Itoa(rowIndex)), then walk ds.ring
-	// clockwise to find the first entry with pos >= rowPos.
-	// If none found, wrap around to ds.ring[0].
-	// Return that entry's nodeID.
-	return 0
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	//TODO: Change the hash function for a more uniform distribution of node ownership
+	rowPos := fnv32(strconv.Itoa(rowIndex))
+
+	ringIdx := sort.Search(len(ds.ring), func(i int) bool {
+		return ds.ring[i].pos >= rowPos
+	})
+
+	if ringIdx == len(ds.ring) {
+		ringIdx = 0
+	}
+
+	return ds.ring[ringIdx].nodeID
 }
 
 // fnv32 hashes a string to a uint32 ring position.
@@ -131,10 +157,34 @@ func fnv32(key string) uint32 {
 
 // loadCSV reads all rows; last column is label, remaining columns are features.
 func loadCSV(path string) ([]Row, error) {
-	// TODO: os.Open(path), csv.NewReader, reader.ReadAll(),
-	// then for each record parse all but last column as float64 Features,
-	// and the last column as int Label.
-	return nil, nil
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var rows []Row
+	for _, record := range records {
+		row := Row{}
+		for _, col := range record[:len(record)-1] {
+			f, err := strconv.ParseFloat(col, 64)
+			if err != nil { continue }
+			row.Features = append(row.Features, f)
+		}
+		label, err := strconv.Atoi(record[len(record)-1])
+		if err == nil {
+			row.Label = label
+		}
+		rows = append(rows, row)
+	}
+
+	return rows, nil
 }
 
 // --- RPC handlers ---
@@ -185,7 +235,5 @@ func call(srv string, name string, args any, reply any) bool {
 	return c.Call(name, args, reply) == nil
 }
 
-var _ = sort.Slice
-var _ = strconv.Itoa
 var _ = csv.NewReader
 var _ = os.Open
