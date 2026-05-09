@@ -14,7 +14,9 @@ import (
 	"time"
 )
 
-const DefaultVNodes = 100 // Increase for larger dataset sizes
+//TODO: Change so that each node doesn't load full csv separately, make more memory efficient for larger datasets
+
+const DefaultVNodes = 500 // Increase for larger dataset sizes
 
 // --- Types ---
 
@@ -94,6 +96,8 @@ func Make(nodeID int, peers []string, dataPath string, vnodes int) *DataStore {
 		}
 	}()
 
+	log.Printf("datastore: node %d loaded %d primary rows from %d total", nodeID, len(ds.primaryShard), len(allRows))
+
 	rightNeighbor := (nodeID + 1) % len(peers)
 	args := ReceiveReplicaArgs{Rows: ds.primaryShard}
 	reply := ReceiveReplicaReply{}
@@ -116,7 +120,7 @@ func (ds *DataStore) buildRing() []RingEntry {
 
 	for peer := range ds.peers {
 		for vnode := range ds.vnodes {
-			entry := RingEntry{pos: fnv32(fmt.Sprintf("%d-%d", peer, vnode)), nodeID: peer}
+			entry := RingEntry{pos: fnv32(fmt.Sprintf("node-%d-vnode-%d", peer, vnode)), nodeID: peer}
 			ring = append(ring, entry)
 		}
 	}
@@ -128,22 +132,10 @@ func (ds *DataStore) buildRing() []RingEntry {
 }
 
 // ownerOf returns the physical node responsible for the given row index.
+// Round-robin guarantees even distribution regardless of cluster size.
+// The consistent-hashing ring is kept for recovery and rebalancing operations.
 func (ds *DataStore) ownerOf(rowIndex int) int {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
-
-	//TODO: Change the hash function for a more uniform distribution of node ownership
-	rowPos := fnv32(strconv.Itoa(rowIndex))
-
-	ringIdx := sort.Search(len(ds.ring), func(i int) bool {
-		return ds.ring[i].pos >= rowPos
-	})
-
-	if ringIdx == len(ds.ring) {
-		ringIdx = 0
-	}
-
-	return ds.ring[ringIdx].nodeID
+	return rowIndex % len(ds.peers)
 }
 
 // fnv32 hashes a string to a uint32 ring position.
@@ -169,16 +161,21 @@ func loadCSV(path string) ([]Row, error) {
 		return nil, err
 	}
 
+	// Iris label map
+	irisLabelMap := map[string]int {
+		"setosa": 0, "versicolor": 1, "virginica": 2,
+	}
+
 	var rows []Row
-	for _, record := range records {
+	for _, record := range records[1:] {
 		row := Row{}
 		for _, col := range record[:len(record)-1] {
 			f, err := strconv.ParseFloat(col, 64)
 			if err != nil { continue }
 			row.Features = append(row.Features, f)
 		}
-		label, err := strconv.Atoi(record[len(record)-1])
-		if err == nil {
+		label, ok := irisLabelMap[record[len(record)-1]]
+		if ok {
 			row.Label = label
 		}
 		rows = append(rows, row)
@@ -202,6 +199,7 @@ func (ds *DataStore) ReceiveReplica(args *ReceiveReplicaArgs, reply *ReceiveRepl
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	ds.replicaShard = args.Rows
+	log.Printf("datastore: node %d received replica of %d rows", ds.nodeID, len(args.Rows))
 	return nil
 }
 

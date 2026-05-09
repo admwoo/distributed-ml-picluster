@@ -27,6 +27,22 @@ var ClusterNodes = []string {
 }
 
 const MonitorAddr = "10.0.0.60:8084"
+const MonitorEnabled = false
+
+// model shape — Iris dataset defaults
+const (
+	NumFeatures = 4
+	NumClasses  = 3
+	ParamSize   = NumFeatures*NumClasses + NumClasses // 15
+	LearningRate = 0.01
+)
+
+const (
+	MaxEpochs            = 2000
+	ConvergenceThreshold = 0.01
+)
+
+const WorkerPort = ":8085"
 
 func PaxosPeers() []string {
 	peers := make([]string, len(ClusterNodes))
@@ -37,8 +53,11 @@ func PaxosPeers() []string {
 }
 
 const HeartBeatInterval = 1
+const HeartbeatTimeout = 3
+const RecoveryTimeout = 10
 
 const CheckpointInterval = 5
+const GradientTimeout = 5
 
 const (
 	SyncSGD = "sync"

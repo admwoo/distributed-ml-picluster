@@ -1,0 +1,277 @@
+package coordinator
+
+import (
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/rpc"
+	"testing"
+	"time"
+
+	"github.com/admwoo/distributed-ml-cluster/config"
+	"github.com/admwoo/distributed-ml-cluster/paramserver"
+)
+
+// Test port ranges (no overlap with paxos: 9001-9005, paramserver: 9201-9202, datastore: 9101-9105)
+//   coordinator RPC : 9301-9303
+//   paxos           : 9311-9313
+//   param server    : 9321-9323
+//   fake workers    : 9331-9333
+
+var (
+	testCoordPeers  = []string{"127.0.0.1:9301", "127.0.0.1:9302", "127.0.0.1:9303"}
+	testPaxosPeers  = []string{"127.0.0.1:9311", "127.0.0.1:9312", "127.0.0.1:9313"}
+	testParamPeers  = []string{"127.0.0.1:9321", "127.0.0.1:9322", "127.0.0.1:9323"}
+	testWorkerPeers = []string{"127.0.0.1:9331", "127.0.0.1:9332", "127.0.0.1:9333"}
+)
+
+func makeCoordCluster(t *testing.T, n int) []*Coordinator {
+	t.Helper()
+	coords := make([]*Coordinator, n)
+	for i := range n {
+		coords[i] = Make(i,
+			testCoordPeers[:n],
+			testPaxosPeers[:n],
+			testWorkerPeers[:n],
+			testParamPeers[:n],
+			"http://localhost:5000", // not used in election test
+		)
+	}
+	return coords
+}
+
+func killAll(coords []*Coordinator) {
+	for _, c := range coords {
+		c.Kill()
+	}
+	time.Sleep(100 * time.Millisecond)
+}
+
+// --- Unit tests ---
+
+func TestAggregateGradients(t *testing.T) {
+	gradients := [][]float64{
+		{1.0, 2.0, 3.0},
+		{3.0, 2.0, 1.0},
+	}
+	result := aggregateGradients(gradients)
+	for i, v := range result {
+		if v != 2.0 {
+			t.Errorf("result[%d] = %f, want 2.0", i, v)
+		}
+	}
+}
+
+func TestAggregateGradientsIdentity(t *testing.T) {
+	single := [][]float64{{1.0, 0.5, -1.0}}
+	result := aggregateGradients(single)
+	for i, v := range result {
+		if v != single[0][i] {
+			t.Errorf("result[%d] = %f, want %f", i, v, single[0][i])
+		}
+	}
+}
+
+func TestInitParams(t *testing.T) {
+	p := initParams(paramserver.Params{})
+	if len(p.Weights) != config.NumFeatures*config.NumClasses {
+		t.Errorf("weights len = %d, want %d", len(p.Weights), config.NumFeatures*config.NumClasses)
+	}
+	if len(p.Bias) != config.NumClasses {
+		t.Errorf("bias len = %d, want %d", len(p.Bias), config.NumClasses)
+	}
+	for _, w := range p.Weights {
+		if w != 0 {
+			t.Error("zero-initialized weights should all be 0")
+		}
+	}
+
+	full := paramserver.Params{Weights: []float64{1.0, 2.0}, Bias: []float64{3.0}}
+	got := initParams(full)
+	if got.Weights[0] != 1.0 || got.Bias[0] != 3.0 {
+		t.Errorf("non-empty params modified: %+v", got)
+	}
+}
+
+func TestParamAddr(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"10.0.0.61:8081", "10.0.0.61" + config.ParamPort},
+		{"127.0.0.1:9101", "127.0.0.1" + config.ParamPort},
+	}
+	for _, tc := range cases {
+		got := paramAddr(tc.in)
+		if got != tc.want {
+			t.Errorf("paramAddr(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// --- Election test ---
+
+// TestElection verifies that exactly one of three coordinators wins the Paxos election.
+func TestElection(t *testing.T) {
+	coords := makeCoordCluster(t, 3)
+	defer killAll(coords)
+
+	deadline := time.Now().Add(3 * time.Second)
+	var leaderCount int
+	for time.Now().Before(deadline) {
+		leaderCount = 0
+		for _, c := range coords {
+			c.mu.Lock()
+			if c.isLeader {
+				leaderCount++
+			}
+			c.mu.Unlock()
+		}
+		if leaderCount == 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if leaderCount != 1 {
+		t.Fatalf("expected exactly 1 leader after election, got %d", leaderCount)
+	}
+}
+
+// --- Epoch loop integration test ---
+
+// fakeWorker is a minimal RPC server that returns a fixed gradient for testing.
+// Arg/reply types are exported so net/rpc's reflection-based method discovery accepts them.
+type fakeWorker struct{ gradient []float64 }
+
+type FakeComputeArgs struct{ Params paramserver.Params }
+type FakeComputeReply struct{ Gradients []float64 }
+type FakeHeartbeatArgs struct{ NodeID int }
+type FakeHeartbeatReply struct{}
+
+func (fw *fakeWorker) ComputeGradient(args *FakeComputeArgs, reply *FakeComputeReply) error {
+	reply.Gradients = append([]float64{}, fw.gradient...)
+	return nil
+}
+
+func (fw *fakeWorker) Heartbeat(args *FakeHeartbeatArgs, reply *FakeHeartbeatReply) error {
+	return nil
+}
+
+func startFakeWorker(t *testing.T, addr string, gradient []float64) net.Listener {
+	t.Helper()
+	rpcs := rpc.NewServer()
+	// register under "Worker" so coordinator's "Worker.ComputeGradient" RPC resolves
+	rpcs.RegisterName("Worker", &fakeWorker{gradient: gradient})
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("fake worker listen %s: %v", addr, err)
+	}
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go rpcs.ServeConn(conn)
+		}
+	}()
+	return l
+}
+
+// fakeSidecar returns an httptest.Server that mimics the Flask sidecar's /gradient endpoint.
+func fakeSidecar(t *testing.T, gradient []float64) *httptest.Server {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"gradients": gradient})
+	}))
+	return ts
+}
+
+// TestEpochLoopHappyPath wires coordinator node 0 against real param servers and fake
+// workers (including an httptest sidecar for the coordinator's own gradient), then
+// verifies the epoch counter advances and params are updated via SGD.
+func TestEpochLoopHappyPath(t *testing.T) {
+	const n = 3
+	dir := t.TempDir()
+
+	// fixed gradient: 0.1 per element, length ParamSize
+	grad := make([]float64, config.ParamSize)
+	for i := range grad {
+		grad[i] = 0.1
+	}
+
+	// param servers on testParamPeers
+	pss := make([]*paramserver.ParamServer, n)
+	for i := range pss {
+		pss[i] = paramserver.Make(testParamPeers[i], dir+"/ps"+string(rune('0'+i))+".json")
+	}
+	defer func() {
+		for _, ps := range pss {
+			ps.Kill()
+		}
+	}()
+
+	// fake workers on testWorkerPeers (nodes 1 and 2; node 0 uses its own sidecar)
+	fakeListeners := make([]net.Listener, n)
+	for i := range fakeListeners {
+		fakeListeners[i] = startFakeWorker(t, testWorkerPeers[i], grad)
+	}
+	defer func() {
+		for _, l := range fakeListeners {
+			l.Close()
+		}
+	}()
+
+	// fake sidecar HTTP server for coordinator node 0's own gradient
+	ts := fakeSidecar(t, grad)
+	defer ts.Close()
+
+	// 1-node paxos so node 0 trivially wins the election; full n-node coord/param/worker peers
+	c := Make(0, testCoordPeers[:n], testPaxosPeers[:1], testWorkerPeers[:n], testParamPeers[:n], ts.URL)
+	defer c.Kill()
+
+	// simulate heartbeats from nodes 1 and 2 so becomeCoordinator considers them healthy
+	go func() {
+		for !c.isdead() {
+			call(testCoordPeers[0], "Coordinator.Heartbeat", &HeartbeatArgs{NodeID: 1}, &HeartbeatReply{})
+			call(testCoordPeers[0], "Coordinator.Heartbeat", &HeartbeatArgs{NodeID: 2}, &HeartbeatReply{})
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
+
+	// wait up to 8s for at least 2 epochs to complete
+	deadline := time.Now().Add(8 * time.Second)
+	for time.Now().Before(deadline) {
+		c.mu.Lock()
+		epoch := c.currentEpoch
+		c.mu.Unlock()
+		if epoch >= 2 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	c.mu.Lock()
+	epoch := c.currentEpoch
+	c.mu.Unlock()
+	if epoch < 2 {
+		t.Fatalf("epoch loop stalled at epoch %d (want >= 2)", epoch)
+	}
+
+	// verify params were written: weights should be non-zero after SGD (0 - 0.01*0.1 = -0.001)
+	args := paramserver.ReadParamsArgs{}
+	reply := paramserver.ReadParamsReply{}
+	for _, ps := range pss[1:] { // param primary is one of nodes 1 or 2
+		ps.ReadParams(&args, &reply)
+		if len(reply.Params.Weights) > 0 {
+			break
+		}
+	}
+	if len(reply.Params.Weights) == 0 {
+		t.Fatal("params never written after epoch loop ran")
+	}
+	for i, w := range reply.Params.Weights {
+		if w == 0.0 {
+			t.Errorf("weight[%d] = 0 after %d epochs (expected SGD update)", i, epoch)
+			break
+		}
+	}
+}

@@ -15,8 +15,11 @@ var testPeers = []string{
 	"127.0.0.1:9105",
 }
 
-// writeTestCSV creates a temp CSV file with nRows rows of the given feature count.
-// Labels cycle 0,1,2. Returns the file path.
+// irisLabels maps cycle index → Iris species string, matching loadCSV's label map.
+var irisLabels = []string{"setosa", "versicolor", "virginica"}
+
+// writeTestCSV creates a temp CSV file with a header row + nRows data rows.
+// Features are all 1.0; labels cycle setosa/versicolor/virginica. Returns the file path.
 func writeTestCSV(t *testing.T, nRows, nFeatures int) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -28,6 +31,15 @@ func writeTestCSV(t *testing.T, nRows, nFeatures int) string {
 	}
 	defer f.Close()
 
+	// header row
+	for j := range nFeatures {
+		f.WriteString("f" + string(rune('0'+j)))
+		if j < nFeatures-1 {
+			f.WriteString(",")
+		}
+	}
+	f.WriteString(",species\n")
+
 	for i := range nRows {
 		for j := range nFeatures {
 			f.WriteString("1.0")
@@ -35,8 +47,7 @@ func writeTestCSV(t *testing.T, nRows, nFeatures int) string {
 				f.WriteString(",")
 			}
 		}
-		// label cycles 0,1,2
-		f.WriteString("," + string(rune('0'+i%3)) + "\n")
+		f.WriteString("," + irisLabels[i%3] + "\n")
 	}
 	return path
 }
