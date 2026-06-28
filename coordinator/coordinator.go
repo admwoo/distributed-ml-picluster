@@ -3,6 +3,7 @@ package coordinator
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -20,29 +21,40 @@ import (
 	"github.com/admwoo/distributed-ml-cluster/paxos"
 )
 
+// errCoordinatorKilled is returned by runElection when this coordinator was Killed
+// before Paxos reached a decision. The caller should return without taking any role.
+var errCoordinatorKilled = errors.New("coordinator: killed before paxos decided")
+
 // --- Types ---
 
 type Coordinator struct {
-	mu                sync.Mutex
-	dead              int32
+	// identities
 	me                int
 	peers             []string // coordinator RPC addresses, indexed by nodeID
 	paramPeers        []string // param server RPC addresses, indexed by nodeID
 	workerPeers       []string // worker RPC addresses, indexed by nodeID
-	px                *paxos.Paxos
-	sidecarAddr       string
-	isLeader          bool
+	sidecarAddr       string // local python ML process
+
+	// role state
+	isLeader              bool
+	electionInstance      int
+	lastReElectionTrigger time.Time // dedupe concurrent triggers within heartbeatTimeout
+	paramPrimaryID        int       // node ID of current param primary (-1 if unset)
+	paramBackupID         int       // node ID of current param backup (-1 if unset)
+	workerList            []int     // ALL active node IDs: coordinator + param nodes + workers
+
+	// failure detection
+	dead              int32
 	currentEpoch      int
 	lastCheckpoint    int
-	workerList        []int // ALL active node IDs: coordinator + param nodes + workers
-	paramPrimaryID    int   // node ID of current param primary (-1 if unset)
-	paramBackupID     int   // node ID of current param backup (-1 if unset)
 	failedNodes       map[int]bool
 	lastHeartbeat     map[int]time.Time
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
 	recoveryTimeout   time.Duration
-	electionInstance  int
+	
+	mu                sync.Mutex
+	px                *paxos.Paxos
 	listener          net.Listener
 }
 
@@ -65,12 +77,16 @@ type PingReply struct{}
 
 // local stubs for outbound worker RPCs — avoids circular import
 type workerComputeArgs struct{ Params paramserver.Params }
-type workerComputeReply struct{ Gradients []float64 }
+type workerComputeReply struct {
+	Gradients []float64
+	RowCount  int
+}
 
 // internal type for concurrent gradient collection
 type gradientResult struct {
 	nodeID    int
 	gradients []float64
+	rowCount  int
 	err       error
 }
 
@@ -115,6 +131,7 @@ func Make(nodeID int, peers []string, paxosPeers []string, workerPeers []string,
 	}
 	c.listener = l
 
+	// RPC server goroutine
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -124,7 +141,7 @@ func Make(nodeID int, peers []string, paxosPeers []string, workerPeers []string,
 			go rpcs.ServeConn(conn)
 		}
 	}()
-
+	// starts node goroutine
 	go c.startNode()
 
 	return c
@@ -170,16 +187,21 @@ func (c *Coordinator) Ping(args *PingArgs, reply *PingReply) error {
 
 // startNode runs on every node at startup: elect a coordinator, then branch.
 func (c *Coordinator) startNode() {
-	winnerID := c.runElection()
+	winnerID, err := c.runElection()
+	if err != nil {
+		return
+	}
 	if winnerID == c.me {
-		c.becomeCoordinator()
+		c.becomeLeader()
 	} else {
-		c.becomeWorker(winnerID)
+		c.becomeFollower(winnerID)
 	}
 }
 
-// runElection proposes own nodeID on the current electionInstance and polls until Paxos decides.
-func (c *Coordinator) runElection() int {
+// runElection proposes own nodeID on the current electionInstance and polls until
+// Paxos decides. Returns errCoordinatorKilled if this coordinator was Killed before
+// a decision was reached, in which case the winner ID is meaningless.
+func (c *Coordinator) runElection() (int, error) {
 	c.mu.Lock()
 	seq := c.electionInstance
 	c.mu.Unlock()
@@ -189,17 +211,19 @@ func (c *Coordinator) runElection() int {
 	for !c.isdead() {
 		fate, val := c.px.Status(seq)
 		if fate == paxos.Decided {
-			return val.(int)
+			return val.(int), nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return -1
+	return 0, errCoordinatorKilled
 }
 
-func (c *Coordinator) becomeCoordinator() {
+func (c *Coordinator) becomeLeader() {
 	c.mu.Lock()
 	c.isLeader = true
+	instance := c.electionInstance
 	c.mu.Unlock()
+	log.Printf("coordinator: node %d became LEADER (election instance %d)", c.me, instance)
 
 	// wait for at least 2 healthy non-coordinator nodes to assign param roles
 	deadline := time.Now().Add(c.recoveryTimeout)
@@ -225,6 +249,7 @@ func (c *Coordinator) becomeCoordinator() {
 		log.Fatal("coordinator: not enough healthy nodes after recovery timeout")
 	}
 
+	// When enough healthy non-coord nodes, randomly select param PBs and send RPCs to set roles
 	rand.Shuffle(len(candidates), func(i, j int) {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
@@ -247,22 +272,27 @@ func (c *Coordinator) becomeCoordinator() {
 	call(c.paramPeers[backID], "ParamServer.SetRole",
 		&paramserver.SetRoleArgs{Role: config.RoleParamBackup, BackupAddr: ""},
 		&paramserver.SetRoleReply{})
+	log.Printf("coordinator: node %d assigned param roles — primary=%d backup=%d", c.me, primID, backID)
 
+	// Starts heartbeat sending to worker nodes, and computation epoch loop
 	go c.heartbeatSender()
 	go c.epochLoop()
 }
 
-func (c *Coordinator) becomeWorker(coordID int) {
+func (c *Coordinator) becomeFollower(coordID int) {
 	c.mu.Lock()
 	c.isLeader = false
+	instance := c.electionInstance
 	c.mu.Unlock()
+	log.Printf("coordinator: node %d became follower (leader=%d, election instance %d)", c.me, coordID, instance)
 
+	// Spin up coordinator watch to trigger re-election on coord failure
 	go c.coordinatorWatchdog(coordID)
 }
 
 // --- Goroutines ---
 
-// heartbeatSender runs on coordinator only; broadcasts to all coordinator and worker peers.
+// heartbeatSender runs on coordinator leader only; broadcasts to all coordinator and worker peers.
 func (c *Coordinator) heartbeatSender() {
 	args := HeartbeatArgs{NodeID: c.me}
 	for !c.isdead() {
@@ -300,16 +330,33 @@ func (c *Coordinator) coordinatorWatchdog(coordID int) {
 }
 
 // triggerReElection increments the election instance and races Paxos again.
+// Deduplicates concurrent calls within heartbeatTimeout: the Coordinator and Worker
+// watchdogs both detect leader death and both call this, so the first call wins
+// and subsequent calls within the window become no-ops. Without this, every
+// redundant trigger bumps electionInstance and nodes can race onto different
+// Paxos sequence numbers.
 func (c *Coordinator) triggerReElection() {
 	c.mu.Lock()
+	if !c.lastReElectionTrigger.IsZero() {
+		elapsed := time.Since(c.lastReElectionTrigger)
+		if elapsed < c.heartbeatTimeout {
+			c.mu.Unlock()
+			log.Printf("coordinator: node %d ignoring duplicate re-election trigger (last fired %v ago)", c.me, elapsed.Round(time.Millisecond))
+			return
+		}
+	}
+	c.lastReElectionTrigger = time.Now()
 	c.electionInstance++
 	c.mu.Unlock()
 
-	winnerID := c.runElection()
+	winnerID, err := c.runElection()
+	if err != nil {
+		return
+	}
 	if winnerID == c.me {
-		c.becomeCoordinator()
+		c.becomeLeader()
 	} else {
-		c.becomeWorker(winnerID)
+		c.becomeFollower(winnerID)
 	}
 }
 
@@ -326,12 +373,13 @@ func (c *Coordinator) epochLoop() {
 		c.postCheckpoint(epoch, "started", 0.0)
 
 		params, err := c.fetchParams()
+		// if failed to fetch params, invoke param recovery path
 		if err != nil {
 			c.runParamRecovery()
 			continue
 		}
 
-		gradients, failedIDs := c.delegateAll(params)
+		gradients, rowCounts, failedIDs := c.delegateAll(params)
 		if len(failedIDs) > 0 {
 			log.Printf("coordinator: epoch %d — %d/%d workers failed: %v", epoch, len(failedIDs), workerCount, failedIDs)
 			if c.runWorkerRecovery(failedIDs) {
@@ -345,7 +393,7 @@ func (c *Coordinator) epochLoop() {
 
 		log.Printf("coordinator: epoch %d — gradients from %d/%d workers", epoch, len(gradients), workerCount)
 
-		averaged := aggregateGradients(gradients)
+		averaged := aggregateGradients(gradients, rowCounts)
 		norm := gradNorm(averaged)
 		log.Printf("coordinator: epoch %d — gradient norm %.6f", epoch, norm)
 
@@ -394,46 +442,57 @@ func (c *Coordinator) epochLoop() {
 // --- Epoch loop helpers ---
 
 // delegateAll sends ComputeGradient to all workers concurrently and collects results.
-// Returns collected gradient vectors and IDs of workers that failed or timed out.
-func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int) {
+// Returns gradient vectors, the row count behind each gradient (for weighted averaging),
+// and IDs of workers that failed or timed out.
+func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int, []int) {
+	//FIXME: Weary of RPC ComputeGradient hanging with no timeout, goroutine leak
+
+	// Worker list snapshot
 	c.mu.Lock()
 	workerList := append([]int{}, c.workerList...)
 	c.mu.Unlock()
 
+	// buffer channel with N workers to avoid failed goroutines blocking forever
 	resultCh := make(chan gradientResult, len(workerList))
 
+	// Fan out, either call local sidecar and send RPC call to other workers to compute their gradients
 	for _, workerID := range workerList {
 		go func(id int) {
 			if id == c.me {
-				g, err := c.callSidecar(params)
-				resultCh <- gradientResult{id, g, err}
+				g, rows, err := c.callSidecar(params)
+				resultCh <- gradientResult{nodeID: id, gradients: g, rowCount: rows, err: err}
 			} else {
 				args := workerComputeArgs{Params: params}
 				reply := workerComputeReply{}
 				if !call(c.workerPeers[id], "Worker.ComputeGradient", &args, &reply) {
-					resultCh <- gradientResult{id, nil, fmt.Errorf("rpc failed")}
+					resultCh <- gradientResult{nodeID: id, err: fmt.Errorf("rpc failed")}
 					return
 				}
-				resultCh <- gradientResult{id, reply.Gradients, nil}
+				resultCh <- gradientResult{nodeID: id, gradients: reply.Gradients, rowCount: reply.RowCount}
 			}
 		}(workerID)
 	}
 
 	timeout := time.After(time.Duration(config.GradientTimeout) * time.Second)
 	var gradients [][]float64
+	var rowCounts []int
 	var failedIDs []int
 	responded := make(map[int]bool)
 
+// fan in, collect until done or timeout
 loop:
 	for len(responded) < len(workerList) {
 		select {
+		// accumulate gradients, marked failed nodes
 		case r := <-resultCh:
 			responded[r.nodeID] = true
 			if r.err != nil {
 				failedIDs = append(failedIDs, r.nodeID)
 			} else {
 				gradients = append(gradients, r.gradients)
+				rowCounts = append(rowCounts, r.rowCount)
 			}
+		// timeout, mark the stragglers and bail (sync mode only)
 		case <-timeout:
 			if config.SGDMode == config.SyncSGD {
 				for _, id := range workerList {
@@ -446,7 +505,7 @@ loop:
 		}
 	}
 
-	return gradients, failedIDs
+	return gradients, rowCounts, failedIDs
 }
 
 // fetchParams reads current params from primary, falls back to backup, then LoadCheckpoint.
@@ -460,14 +519,19 @@ func (c *Coordinator) fetchParams() (paramserver.Params, error) {
 
 	args := paramserver.ReadParamsArgs{}
 	reply := paramserver.ReadParamsReply{}
-
+	// Try primary param server first
 	if call(paramPeers[primID], "ParamServer.ReadParams", &args, &reply) {
 		return initParams(reply.Params), nil
 	}
+
+	// plan B, fall back to the backup param server
+	args = paramserver.ReadParamsArgs{}
+	reply = paramserver.ReadParamsReply{}
 	if call(paramPeers[backID], "ParamServer.ReadParams", &args, &reply) {
 		return initParams(reply.Params), nil
 	}
 
+	// plan C, fall back to params saved on disk from any peer
 	cpArgs := paramserver.LoadCheckpointArgs{}
 	cpReply := paramserver.LoadCheckpointReply{}
 	for _, peer := range paramPeers {
@@ -590,13 +654,94 @@ func (c *Coordinator) callSidecarEvaluate(params paramserver.Params) (int, int, 
 	return er.Correct, er.Total, nil
 }
 
-// --- Recovery stubs (implemented after happy path is verified) ---
+// --- Recovery ---
 
+// probeParamServer asks the param server at nodeID for its params. A successful
+// reply means the server is reachable AND hands back the params it currently holds,
+// so the probe doubles as a fetch. Recovery must talk to param servers directly
+// rather than trust heartbeats: a heartbeat comes from the node's coordinator/worker
+// goroutine and keeps beating even if only the param server died (or is partitioned).
+// paramPeers is set once in Make and never mutated, so it is read without the lock.
+func (c *Coordinator) probeParamServer(nodeID int) (paramserver.Params, bool) {
+	args := paramserver.ReadParamsArgs{}
+	reply := paramserver.ReadParamsReply{}
+	if !call(c.paramPeers[nodeID], "ParamServer.ReadParams", &args, &reply) {
+		return paramserver.Params{}, false
+	}
+	return reply.Params, true
+}
+
+// runParamRecovery handles the loss of a param node. It probes the current primary
+// then backup; the first to respond is the survivor and its params are authoritative
+// (the backup is kept in sync by the primary's synchronous replication on every
+// successful WriteParams). The survivor becomes the new primary, a healthy spare
+// becomes the new backup and is re-seeded with the survivor's params, and both are
+// re-assigned their roles. The epoch loop's `continue` then re-runs the epoch against
+// the fresh roles, restarting cleanly from the last committed params.
+//
+// Phase 1 scope: a single param-node failure with a healthy spare available. If both
+// param nodes are unreachable, or no spare exists, it logs and returns without
+// changing roles — the epoch loop retries the next iteration (a visible, non-
+// destructive spin) until the situation resolves.
 func (c *Coordinator) runParamRecovery() {
 	c.mu.Lock()
 	epoch := c.currentEpoch
+	primID := c.paramPrimaryID
+	backID := c.paramBackupID
+	me := c.me
+	workerList := append([]int{}, c.workerList...)
 	c.mu.Unlock()
-	log.Printf("coordinator: param recovery triggered on epoch %d (not yet implemented)", epoch)
+
+	// Find the survivor holding current params; prefer the primary.
+	var survivorID int
+	var params paramserver.Params
+	if p, ok := c.probeParamServer(primID); ok {
+		survivorID, params = primID, p
+	} else if p, ok := c.probeParamServer(backID); ok {
+		survivorID, params = backID, p
+	} else {
+		log.Printf("coordinator: param recovery epoch %d — both param nodes (%d,%d) unreachable, retrying", epoch, primID, backID)
+		return
+	}
+
+	// Pick a healthy spare for the new backup: any reachable param server that is not
+	// the new primary. The coordinator excludes itself, matching becomeLeader's rule.
+	newBackID := -1
+	for _, id := range workerList {
+		if id == survivorID || id == me {
+			continue
+		}
+		if _, ok := c.probeParamServer(id); ok {
+			newBackID = id
+			break
+		}
+	}
+	if newBackID == -1 {
+		log.Printf("coordinator: param recovery epoch %d — survivor=%d but no healthy spare for backup, retrying", epoch, survivorID)
+		return
+	}
+
+	// Reassign roles, then seed the new backup with the survivor's params so reads
+	// from it are correct immediately, before the next WriteParams replicates.
+	primAddr := c.paramPeers[survivorID]
+	backAddr := c.paramPeers[newBackID]
+	call(primAddr, "ParamServer.SetRole",
+		&paramserver.SetRoleArgs{Role: config.RoleParamPrimary, BackupAddr: backAddr},
+		&paramserver.SetRoleReply{})
+	call(backAddr, "ParamServer.SetRole",
+		&paramserver.SetRoleArgs{Role: config.RoleParamBackup, BackupAddr: ""},
+		&paramserver.SetRoleReply{})
+	call(backAddr, "ParamServer.ReplicateParams",
+		&paramserver.ReplicateParamsArgs{Params: params},
+		&paramserver.ReplicateParamsReply{})
+
+	c.mu.Lock()
+	c.paramPrimaryID = survivorID
+	c.paramBackupID = newBackID
+	c.mu.Unlock()
+
+	log.Printf("coordinator: param recovery epoch %d — primary %d->%d, backup %d->%d",
+		epoch, primID, survivorID, backID, newBackID)
 }
 
 func (c *Coordinator) runWorkerRecovery(failedIDs []int) bool {
@@ -616,6 +761,7 @@ type sidecarGradientReq struct {
 
 type sidecarGradientResp struct {
 	Gradients []float64 `json:"gradients"`
+	RowCount  int       `json:"row_count"`
 }
 
 type sidecarEvaluateResp struct {
@@ -626,30 +772,30 @@ type sidecarEvaluateResp struct {
 type workerEvaluateArgs struct{ Params paramserver.Params }
 type workerEvaluateReply struct{ Correct, Total int }
 
-// callSidecar posts params to the coordinator's local sidecar and returns the gradient vector.
-func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, error) {
+// callSidecar posts params to the coordinator's local sidecar and returns the gradient vector and row count.
+func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, int, error) {
 	req := sidecarGradientReq{
 		Weights: reshapeWeights(params.Weights),
 		Bias:    params.Bias,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := http.Post(c.sidecarAddr+"/gradient", "application/json", bytes.NewReader(body))
 	if err != nil || resp.StatusCode != 200 {
-		return nil, fmt.Errorf("sidecar unavailable on coordinator node %d", c.me)
+		return nil, 0, fmt.Errorf("sidecar unavailable on coordinator node %d", c.me)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var gr sidecarGradientResp
 	if err := json.Unmarshal(data, &gr); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return gr.Gradients, nil
+	return gr.Gradients, gr.RowCount, nil
 }
 
 // reshapeWeights converts a flat weight vector into a [NumClasses][NumFeatures] matrix.
@@ -688,12 +834,19 @@ func (c *Coordinator) postCheckpoint(epoch int, status string, accuracy float64)
 
 // --- Gradient aggregation ---
 
-func aggregateGradients(gradients [][]float64) []float64 {
-	n := len(gradients)
+// aggregateGradients computes the row-count-weighted mean of per-worker mean gradients.
+// Each gradients[i] is already the mean gradient over rowCounts[i] rows on that worker,
+// so the global mean over all rows is sum(gradient_i * rowCount_i) / sum(rowCount_i).
+func aggregateGradients(gradients [][]float64, rowCounts []int) []float64 {
+	var totalRows int
+	for _, r := range rowCounts {
+		totalRows += r
+	}
 	result := make([]float64, len(gradients[0]))
-	for _, g := range gradients {
-		for i, v := range g {
-			result[i] += v / float64(n)
+	for i, g := range gradients {
+		weight := float64(rowCounts[i]) / float64(totalRows)
+		for j, v := range g {
+			result[j] += v * weight
 		}
 	}
 	return result

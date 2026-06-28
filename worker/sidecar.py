@@ -52,7 +52,7 @@ def gradient():
 
     # flatten: weights first, then bias — matches config.ParamSize convention
     flat = np.concatenate([dW.flatten(), db])
-    return jsonify({"gradients": flat.tolist()})
+    return jsonify({"gradients": flat.tolist(), "row_count": n})
 
 @app.route("/evaluate", methods=["POST"])
 def evaluate():

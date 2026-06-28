@@ -20,19 +20,25 @@ import (
 // --- Types ---
 
 type Worker struct {
-	mu            sync.Mutex
+	// identities
 	nodeID        int
 	coordPeers    []string // coordinator addresses for heartbeat + re-election
 	sidecarAddr   string   // "http://localhost:5000"
 	datastoreAddr string
+	
 	lastHeartbeat time.Time // last time coordinator called our Heartbeat()
+
+	mu            sync.Mutex
 	listener      net.Listener
 }
 
 // --- RPC types ---
 
 type ComputeGradientArgs struct{ Params paramserver.Params }
-type ComputeGradientReply struct{ Gradients []float64 }
+type ComputeGradientReply struct {
+	Gradients []float64
+	RowCount  int
+}
 
 type HeartbeatArgs struct{ NodeID int }
 type HeartbeatReply struct{}
@@ -73,6 +79,7 @@ func Make(nodeID int, coordPeers []string, datastoreAddr string, listenAddr stri
 	}
 	w.listener = l
 
+	// starts RPC server
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -82,12 +89,15 @@ func Make(nodeID int, coordPeers []string, datastoreAddr string, listenAddr stri
 			go rpcs.ServeConn(conn)
 		}
 	}()
-
+	// blocks until sidecar server returns 200, with timeout
 	w.waitForSidecar()
-
+	
+	// send rpc to datastore to get shards
 	rows := w.fetchShard()
+	// POST shards to the sidecar
 	w.loadShard(rows)
 
+	// spawns failure detection goroutines
 	go w.heartbeatSender()
 	go w.coordinatorWatchdog()
 
@@ -102,11 +112,12 @@ func (w *Worker) Kill() {
 
 // ComputeGradient receives current params, delegates to sidecar, and returns the gradient vector.
 func (w *Worker) ComputeGradient(args *ComputeGradientArgs, reply *ComputeGradientReply) error {
-	gradients, err := w.requestGradients(args.Params)
+	gradients, rowCount, err := w.requestGradients(args.Params)
 	if err != nil {
 		return fmt.Errorf("sidecar gradient error: %w", err)
 	}
 	reply.Gradients = gradients
+	reply.RowCount = rowCount
 	return nil
 }
 
@@ -139,6 +150,7 @@ func (w *Worker) Ping(args *PingArgs, reply *PingReply) error {
 // heartbeatSender periodically calls Coordinator.Heartbeat on all coordinator peers
 // so the coordinator knows this worker is alive.
 func (w *Worker) heartbeatSender() {
+	// worker broadcasts to all coordinators, all non-leaders ignore
 	args := coordHeartbeatArgs{NodeID: w.nodeID}
 	for {
 		for _, peer := range w.coordPeers {
@@ -148,7 +160,7 @@ func (w *Worker) heartbeatSender() {
 	}
 }
 
-// coordinatorWatchdog monitors the coordinator's heartbeat and triggers re-election on timeout.
+// coordinatorWatchdog monitors the coordinator leader's heartbeat and triggers re-election on timeout.
 func (w *Worker) coordinatorWatchdog() {
 	timeout := time.Duration(config.HeartbeatTimeout) * time.Second
 	for {
@@ -208,31 +220,32 @@ type gradientRequest struct {
 
 type gradientResponse struct {
 	Gradients []float64 `json:"gradients"`
+	RowCount  int       `json:"row_count"`
 }
 
-func (w *Worker) requestGradients(params paramserver.Params) ([]float64, error) {
+func (w *Worker) requestGradients(params paramserver.Params) ([]float64, int, error) {
 	req := gradientRequest{
 		Weights: reshapeWeights(params.Weights),
 		Bias:    params.Bias,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := http.Post(w.sidecarAddr+"/gradient", "application/json", bytes.NewReader(body))
 	if err != nil || resp.StatusCode != 200 {
-		return nil, fmt.Errorf("sidecar unavailable on node %d", w.nodeID)
+		return nil, 0, fmt.Errorf("sidecar unavailable on node %d", w.nodeID)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	var gr gradientResponse
 	if err := json.Unmarshal(data, &gr); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return gr.Gradients, nil
+	return gr.Gradients, gr.RowCount, nil
 }
 
 type evaluateRequest struct {

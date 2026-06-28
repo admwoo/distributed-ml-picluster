@@ -26,8 +26,11 @@ var ClusterNodes = []string {
 	"10.0.0.65",
 }
 
-const MonitorAddr = "10.0.0.60:8084"
-const MonitorEnabled = false
+// Monitor (Layer 0). Defaults target the dedicated Pi node. These are vars, not
+// consts, so the local simulation can repoint them at localhost and toggle pushing
+// without touching the Pi build (see the simulation -monitor flag).
+var MonitorAddr = "10.0.0.60:8084"
+var MonitorEnabled = false
 
 // model shape — Iris dataset defaults
 const (

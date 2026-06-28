@@ -55,7 +55,8 @@ func TestAggregateGradients(t *testing.T) {
 		{1.0, 2.0, 3.0},
 		{3.0, 2.0, 1.0},
 	}
-	result := aggregateGradients(gradients)
+	rowCounts := []int{50, 50}
+	result := aggregateGradients(gradients, rowCounts)
 	for i, v := range result {
 		if v != 2.0 {
 			t.Errorf("result[%d] = %f, want 2.0", i, v)
@@ -65,11 +66,88 @@ func TestAggregateGradients(t *testing.T) {
 
 func TestAggregateGradientsIdentity(t *testing.T) {
 	single := [][]float64{{1.0, 0.5, -1.0}}
-	result := aggregateGradients(single)
+	result := aggregateGradients(single, []int{50})
 	for i, v := range result {
 		if v != single[0][i] {
 			t.Errorf("result[%d] = %f, want %f", i, v, single[0][i])
 		}
+	}
+}
+
+func TestAggregateGradientsWeighted(t *testing.T) {
+	// worker A has 1 row, gradient [0]; worker B has 3 rows, gradient [4].
+	// global mean should be (1*0 + 3*4) / 4 = 3.0, not the unweighted (0+4)/2 = 2.0.
+	gradients := [][]float64{{0.0}, {4.0}}
+	rowCounts := []int{1, 3}
+	result := aggregateGradients(gradients, rowCounts)
+	if result[0] != 3.0 {
+		t.Errorf("weighted result = %f, want 3.0", result[0])
+	}
+}
+
+// TestParamRecovery kills the param primary and verifies runParamRecovery promotes
+// the surviving backup to primary, assigns a spare as the new backup, and re-seeds
+// that spare with the survivor's params — all without a running epoch loop.
+func TestParamRecovery(t *testing.T) {
+	dir := t.TempDir()
+
+	// three param servers: 0=primary, 1=backup, 2=spare
+	ps := make([]*paramserver.ParamServer, 3)
+	for i := range ps {
+		ps[i] = paramserver.Make(testParamPeers[i], dir+"/ps"+string(rune('0'+i))+".json")
+	}
+	defer func() {
+		for _, p := range ps {
+			if p != nil {
+				p.Kill()
+			}
+		}
+	}()
+
+	// assign roles and commit some params; the write replicates primary -> backup
+	call(testParamPeers[0], "ParamServer.SetRole",
+		&paramserver.SetRoleArgs{Role: config.RoleParamPrimary, BackupAddr: testParamPeers[1]},
+		&paramserver.SetRoleReply{})
+	call(testParamPeers[1], "ParamServer.SetRole",
+		&paramserver.SetRoleArgs{Role: config.RoleParamBackup, BackupAddr: ""},
+		&paramserver.SetRoleReply{})
+
+	want := paramserver.Params{Weights: []float64{1, 2, 3}, Bias: []float64{4}}
+	if !call(testParamPeers[0], "ParamServer.WriteParams",
+		&paramserver.WriteParamsArgs{Params: want}, &paramserver.WriteParamsReply{}) {
+		t.Fatal("initial WriteParams to primary failed")
+	}
+
+	// minimal coordinator: node 0 is the coordinator (and current primary) and dies.
+	c := &Coordinator{
+		me:             0,
+		paramPeers:     testParamPeers[:3],
+		paramPrimaryID: 0,
+		paramBackupID:  1,
+		workerList:     []int{0, 1, 2},
+	}
+
+	// kill the primary's param server, then recover
+	ps[0].Kill()
+	ps[0] = nil
+	time.Sleep(50 * time.Millisecond)
+
+	c.runParamRecovery()
+
+	if c.paramPrimaryID != 1 {
+		t.Errorf("paramPrimaryID = %d, want 1 (backup promoted)", c.paramPrimaryID)
+	}
+	if c.paramBackupID != 2 {
+		t.Errorf("paramBackupID = %d, want 2 (spare assigned)", c.paramBackupID)
+	}
+
+	// the new backup (node 2) must have been re-seeded with the committed params
+	reply := paramserver.ReadParamsReply{}
+	if !call(testParamPeers[2], "ParamServer.ReadParams", &paramserver.ReadParamsArgs{}, &reply) {
+		t.Fatal("ReadParams on new backup failed")
+	}
+	if len(reply.Params.Weights) != 3 || reply.Params.Weights[0] != 1 || reply.Params.Bias[0] != 4 {
+		t.Errorf("new backup params = %+v, want %+v", reply.Params, want)
 	}
 }
 
@@ -142,12 +220,16 @@ func TestElection(t *testing.T) {
 type fakeWorker struct{ gradient []float64 }
 
 type FakeComputeArgs struct{ Params paramserver.Params }
-type FakeComputeReply struct{ Gradients []float64 }
+type FakeComputeReply struct {
+	Gradients []float64
+	RowCount  int
+}
 type FakeHeartbeatArgs struct{ NodeID int }
 type FakeHeartbeatReply struct{}
 
 func (fw *fakeWorker) ComputeGradient(args *FakeComputeArgs, reply *FakeComputeReply) error {
 	reply.Gradients = append([]float64{}, fw.gradient...)
+	reply.RowCount = 50
 	return nil
 }
 
@@ -180,7 +262,7 @@ func startFakeWorker(t *testing.T, addr string, gradient []float64) net.Listener
 func fakeSidecar(t *testing.T, gradient []float64) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"gradients": gradient})
+		json.NewEncoder(w).Encode(map[string]any{"gradients": gradient, "row_count": 50})
 	}))
 	return ts
 }
@@ -228,7 +310,7 @@ func TestEpochLoopHappyPath(t *testing.T) {
 	c := Make(0, testCoordPeers[:n], testPaxosPeers[:1], testWorkerPeers[:n], testParamPeers[:n], ts.URL)
 	defer c.Kill()
 
-	// simulate heartbeats from nodes 1 and 2 so becomeCoordinator considers them healthy
+	// simulate heartbeats from nodes 1 and 2 so becomeLeader considers them healthy
 	go func() {
 		for !c.isdead() {
 			call(testCoordPeers[0], "Coordinator.Heartbeat", &HeartbeatArgs{NodeID: 1}, &HeartbeatReply{})

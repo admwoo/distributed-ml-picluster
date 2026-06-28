@@ -1,14 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/admwoo/distributed-ml-cluster/config"
 	"github.com/admwoo/distributed-ml-cluster/coordinator"
 	"github.com/admwoo/distributed-ml-cluster/datastore"
 	"github.com/admwoo/distributed-ml-cluster/paramserver"
@@ -42,14 +46,22 @@ func sidecarAddr(nodeID int) string {
 func main() {
 	csvPath := flag.String("data", "", "path to Iris CSV file (required)")
 	n       := flag.Int("n", 3, "number of nodes to simulate")
+	monitor := flag.Bool("monitor", true, "push epoch checkpoints to a local monitor on 127.0.0.1:8084")
 	flag.Parse()
 
 	if *csvPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: simulation -data <iris.csv> [-n <nodes>]")
+		fmt.Fprintln(os.Stderr, "usage: simulation -data <iris.csv> [-n <nodes>] [-monitor=false]")
 		os.Exit(1)
 	}
 	if _, err := os.Stat(*csvPath); err != nil {
 		log.Fatalf("simulation: cannot read data file %q: %v", *csvPath, err)
+	}
+
+	// Repoint the monitor at localhost for the simulation; the Pi build keeps the
+	// default cluster address. postCheckpoint is non-fatal if the monitor is down.
+	if *monitor {
+		config.MonitorAddr = "127.0.0.1:8084"
+		config.MonitorEnabled = true
 	}
 
 	paxosPeers, coordPeers, paramPeers, dataPeers, workerPeers := simAddrs(*n)
@@ -60,11 +72,17 @@ func main() {
 	for i := range *n {
 		log.Printf("  node %d:  python3 worker/sidecar.py --port %d", i, 15000+i)
 	}
+	if *monitor {
+		log.Println("simulation: start the monitor in a separate terminal, then open http://127.0.0.1:8084 :")
+		log.Println("  python3 monitor/monitor.py")
+	}
 	log.Println()
 
-	// param servers and datastores start synchronously — workers depend on them
+	// param servers and datastores start synchronously — workers depend on them.
+	// Keep the param-server handles so the kill command can take one down at runtime.
+	paramServers := make([]*paramserver.ParamServer, *n)
 	for i := range *n {
-		paramserver.Make(paramPeers[i], fmt.Sprintf("%s/param_%d.json", checkpointDir, i))
+		paramServers[i] = paramserver.Make(paramPeers[i], fmt.Sprintf("%s/param_%d.json", checkpointDir, i))
 		datastore.Make(i, dataPeers, *csvPath, datastore.DefaultVNodes)
 	}
 
@@ -98,9 +116,12 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 
+	go commandLoop(coords, paramServers)
+
 	select {
 	case <-done:
 		log.Println("simulation: all workers ready, training in progress")
+		log.Println("simulation: commands — 'kill coord <N>', 'kill param <N>', 'quit' to exit")
 		<-sig
 	case <-sig:
 	}
@@ -114,6 +135,51 @@ func main() {
 	for _, w := range workers {
 		if w != nil {
 			w.Kill()
+		}
+	}
+}
+
+// commandLoop reads stdin and dispatches admin commands for failure injection.
+// Supported: "kill coord <N>" to kill coordinator N, "kill param <N>" to kill the
+// param server on node N (leaving its coordinator/worker alive — exercises param
+// recovery, which heartbeats alone cannot detect).
+func commandLoop(coords []*coordinator.Coordinator, paramServers []*paramserver.ParamServer) {
+	scanner := bufio.NewScanner(os.Stdin)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		switch {
+		case len(parts) == 3 && parts[0] == "kill" && parts[1] == "coord":
+			id, err := strconv.Atoi(parts[2])
+			if err != nil || id < 0 || id >= len(coords) {
+				log.Printf("simulation: invalid coord id %q", parts[2])
+				continue
+			}
+			if coords[id] == nil {
+				log.Printf("simulation: coord %d already nil", id)
+				continue
+			}
+			log.Printf("simulation: KILLING coordinator %d", id)
+			coords[id].Kill()
+			coords[id] = nil
+		case len(parts) == 3 && parts[0] == "kill" && parts[1] == "param":
+			id, err := strconv.Atoi(parts[2])
+			if err != nil || id < 0 || id >= len(paramServers) {
+				log.Printf("simulation: invalid param id %q", parts[2])
+				continue
+			}
+			if paramServers[id] == nil {
+				log.Printf("simulation: param %d already nil", id)
+				continue
+			}
+			log.Printf("simulation: KILLING param server %d", id)
+			paramServers[id].Kill()
+			paramServers[id] = nil
+		default:
+			log.Printf("simulation: unknown command %q", line)
 		}
 	}
 }
