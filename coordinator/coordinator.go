@@ -80,6 +80,7 @@ type workerComputeArgs struct{ Params paramserver.Params }
 type workerComputeReply struct {
 	Gradients []float64
 	RowCount  int
+	Loss      float64
 }
 
 // internal type for concurrent gradient collection
@@ -87,6 +88,7 @@ type gradientResult struct {
 	nodeID    int
 	gradients []float64
 	rowCount  int
+	loss      float64
 	err       error
 }
 
@@ -363,7 +365,17 @@ func (c *Coordinator) triggerReElection() {
 // --- Epoch loop ---
 
 func (c *Coordinator) epochLoop() {
+	// Loop-local early-stopping state (epochLoop is a single goroutine, no lock needed):
+	// track the best loss seen and how many epochs since it last meaningfully improved.
+	bestLoss := math.MaxFloat64
+	patienceCounter := 0
+
 	for !c.isdead() {
+		// Pace every iteration, including the recovery/retry paths that `continue`
+		// below. Without this the loop spins at hundreds of epochs/sec, and the fresh
+		// rpc.Dial per call exhausts ephemeral ports ("can't assign requested address").
+		time.Sleep(time.Duration(config.EpochPaceMillis) * time.Millisecond)
+
 		c.mu.Lock()
 		epoch := c.currentEpoch
 		workerCount := len(c.workerList)
@@ -379,7 +391,7 @@ func (c *Coordinator) epochLoop() {
 			continue
 		}
 
-		gradients, rowCounts, failedIDs := c.delegateAll(params)
+		gradients, rowCounts, losses, failedIDs := c.delegateAll(params)
 		if len(failedIDs) > 0 {
 			log.Printf("coordinator: epoch %d — %d/%d workers failed: %v", epoch, len(failedIDs), workerCount, failedIDs)
 			if c.runWorkerRecovery(failedIDs) {
@@ -395,6 +407,7 @@ func (c *Coordinator) epochLoop() {
 
 		averaged := aggregateGradients(gradients, rowCounts)
 		norm := gradNorm(averaged)
+		avgLoss := averageLoss(losses)
 		log.Printf("coordinator: epoch %d — gradient norm %.6f", epoch, norm)
 
 		if err := c.writeParams(params, averaged); err != nil {
@@ -423,14 +436,25 @@ func (c *Coordinator) epochLoop() {
 		c.currentEpoch++
 		c.mu.Unlock()
 
-		log.Printf("coordinator: epoch %d complete in %v — accuracy %.4f (%.1f%%)",
-			epoch, time.Since(start).Round(time.Millisecond), accuracy, accuracy*100)
+		log.Printf("coordinator: epoch %d complete in %v — accuracy %.4f (%.1f%%), loss %.6f",
+			epoch, time.Since(start).Round(time.Millisecond), accuracy, accuracy*100, avgLoss)
 
-		if norm < config.ConvergenceThreshold {
-			log.Printf("coordinator: converged at epoch %d — grad norm %.6f, accuracy %.1f%%", epoch, norm, accuracy*100)
-			c.postCheckpoint(epoch, "converged", accuracy)
-			return
+		// Plateau-based early stopping: stop once the averaged loss has failed to
+		// improve by more than MinLossDelta for Patience consecutive epochs.
+		if avgLoss < bestLoss-config.MinLossDelta {
+			bestLoss = avgLoss
+			patienceCounter = 0
+		} else {
+			patienceCounter++
+			if patienceCounter >= config.Patience {
+				log.Printf("coordinator: converged at epoch %d — loss plateaued at %.6f for %d epochs, accuracy %.1f%%",
+					epoch, bestLoss, patienceCounter, accuracy*100)
+				c.postCheckpoint(epoch, "converged", accuracy)
+				return
+			}
 		}
+
+		// Hard cap fallback.
 		if epoch+1 >= config.MaxEpochs {
 			log.Printf("coordinator: max epochs (%d) reached — final accuracy %.1f%%", config.MaxEpochs, accuracy*100)
 			c.postCheckpoint(epoch, "max_epochs_reached", accuracy)
@@ -443,8 +467,8 @@ func (c *Coordinator) epochLoop() {
 
 // delegateAll sends ComputeGradient to all workers concurrently and collects results.
 // Returns gradient vectors, the row count behind each gradient (for weighted averaging),
-// and IDs of workers that failed or timed out.
-func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int, []int) {
+// the per-worker regularized loss, and IDs of workers that failed or timed out.
+func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int, []float64, []int) {
 	//FIXME: Weary of RPC ComputeGradient hanging with no timeout, goroutine leak
 
 	// Worker list snapshot
@@ -459,8 +483,8 @@ func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int
 	for _, workerID := range workerList {
 		go func(id int) {
 			if id == c.me {
-				g, rows, err := c.callSidecar(params)
-				resultCh <- gradientResult{nodeID: id, gradients: g, rowCount: rows, err: err}
+				g, rows, loss, err := c.callSidecar(params)
+				resultCh <- gradientResult{nodeID: id, gradients: g, rowCount: rows, loss: loss, err: err}
 			} else {
 				args := workerComputeArgs{Params: params}
 				reply := workerComputeReply{}
@@ -468,7 +492,7 @@ func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int
 					resultCh <- gradientResult{nodeID: id, err: fmt.Errorf("rpc failed")}
 					return
 				}
-				resultCh <- gradientResult{nodeID: id, gradients: reply.Gradients, rowCount: reply.RowCount}
+				resultCh <- gradientResult{nodeID: id, gradients: reply.Gradients, rowCount: reply.RowCount, loss: reply.Loss}
 			}
 		}(workerID)
 	}
@@ -476,6 +500,7 @@ func (c *Coordinator) delegateAll(params paramserver.Params) ([][]float64, []int
 	timeout := time.After(time.Duration(config.GradientTimeout) * time.Second)
 	var gradients [][]float64
 	var rowCounts []int
+	var losses []float64
 	var failedIDs []int
 	responded := make(map[int]bool)
 
@@ -491,6 +516,7 @@ loop:
 			} else {
 				gradients = append(gradients, r.gradients)
 				rowCounts = append(rowCounts, r.rowCount)
+				losses = append(losses, r.loss)
 			}
 		// timeout, mark the stragglers and bail (sync mode only)
 		case <-timeout:
@@ -505,7 +531,7 @@ loop:
 		}
 	}
 
-	return gradients, rowCounts, failedIDs
+	return gradients, rowCounts, losses, failedIDs
 }
 
 // fetchParams reads current params from primary, falls back to backup, then LoadCheckpoint.
@@ -583,7 +609,7 @@ func (c *Coordinator) writeParams(old paramserver.Params, gradients []float64) e
 type evalResult struct{ correct, total int }
 
 // evaluateAccuracy asks every worker (and the coordinator's own sidecar) to evaluate
-// their local shard, then returns the weighted average accuracy across all rows.
+// their local shard, then returns the row-weighted average accuracy across all rows.
 func (c *Coordinator) evaluateAccuracy() float64 {
 	params, err := c.fetchParams()
 	if err != nil {
@@ -762,6 +788,7 @@ type sidecarGradientReq struct {
 type sidecarGradientResp struct {
 	Gradients []float64 `json:"gradients"`
 	RowCount  int       `json:"row_count"`
+	Loss      float64   `json:"loss"`
 }
 
 type sidecarEvaluateResp struct {
@@ -772,30 +799,31 @@ type sidecarEvaluateResp struct {
 type workerEvaluateArgs struct{ Params paramserver.Params }
 type workerEvaluateReply struct{ Correct, Total int }
 
-// callSidecar posts params to the coordinator's local sidecar and returns the gradient vector and row count.
-func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, int, error) {
+// callSidecar posts params to the coordinator's local sidecar and returns the gradient
+// vector, row count, and regularized loss.
+func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, int, float64, error) {
 	req := sidecarGradientReq{
 		Weights: reshapeWeights(params.Weights),
 		Bias:    params.Bias,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	resp, err := http.Post(c.sidecarAddr+"/gradient", "application/json", bytes.NewReader(body))
 	if err != nil || resp.StatusCode != 200 {
-		return nil, 0, fmt.Errorf("sidecar unavailable on coordinator node %d", c.me)
+		return nil, 0, 0, fmt.Errorf("sidecar unavailable on coordinator node %d", c.me)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	var gr sidecarGradientResp
 	if err := json.Unmarshal(data, &gr); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return gr.Gradients, gr.RowCount, nil
+	return gr.Gradients, gr.RowCount, gr.Loss, nil
 }
 
 // reshapeWeights converts a flat weight vector into a [NumClasses][NumFeatures] matrix.
@@ -858,6 +886,20 @@ func gradNorm(g []float64) float64 {
 		sum += v * v
 	}
 	return math.Sqrt(sum)
+}
+
+// averageLoss is the mean of the per-worker regularized losses. Each worker computes
+// loss on its local shard with the same (global) L2 term, so the mean is a valid
+// global loss estimate — the same reasoning that makes gradient averaging valid.
+func averageLoss(losses []float64) float64 {
+	if len(losses) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, l := range losses {
+		sum += l
+	}
+	return sum / float64(len(losses))
 }
 
 // --- Helpers ---

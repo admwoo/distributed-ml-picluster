@@ -11,6 +11,11 @@ args = parser.parse_args()
 X = None  # (n_samples, num_features)
 y = None  # (n_samples,) int labels
 
+# L2 weight-decay coefficient. Unregularized softmax regression on (near-)separable
+# data has no finite optimum — weights grow without bound. A small L2 term gives a
+# finite optimum so the loss converges. Keep in sync with config.L2Lambda.
+L2_LAMBDA = 0.01
+
 @app.route("/health")
 def health():
     shard_size = len(X) if X is not None else 0
@@ -45,14 +50,18 @@ def gradient():
     one_hot = np.zeros((n, num_classes))
     one_hot[np.arange(n), y] = 1.0
 
-    # gradients
+    # gradients (bias is left unregularized, as is standard)
     diff = probs - one_hot                                       # (n, num_classes)
-    dW = (diff.T @ X) / n                                       # (num_classes, num_features)
+    dW = (diff.T @ X) / n + L2_LAMBDA * W                       # (num_classes, num_features)
     db = diff.mean(axis=0)                                       # (num_classes,)
+
+    # regularized cross-entropy loss on this shard (mean data loss + L2 term). The
+    # coordinator averages these across workers to drive plateau-based early stopping.
+    loss = float(-np.mean(np.log(probs[np.arange(n), y] + 1e-9)) + (L2_LAMBDA / 2) * np.sum(W ** 2))
 
     # flatten: weights first, then bias — matches config.ParamSize convention
     flat = np.concatenate([dW.flatten(), db])
-    return jsonify({"gradients": flat.tolist(), "row_count": n})
+    return jsonify({"gradients": flat.tolist(), "row_count": n, "loss": loss})
 
 @app.route("/evaluate", methods=["POST"])
 def evaluate():

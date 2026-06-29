@@ -38,13 +38,17 @@ type ComputeGradientArgs struct{ Params paramserver.Params }
 type ComputeGradientReply struct {
 	Gradients []float64
 	RowCount  int
+	Loss      float64
 }
 
 type HeartbeatArgs struct{ NodeID int }
 type HeartbeatReply struct{}
 
 type EvaluateArgs struct{ Params paramserver.Params }
-type EvaluateReply struct{ Correct int; Total int }
+type EvaluateReply struct {
+	Correct int
+	Total   int
+}
 
 type PingArgs struct{}
 type PingReply struct{}
@@ -110,14 +114,16 @@ func (w *Worker) Kill() {
 
 // --- RPC handlers ---
 
-// ComputeGradient receives current params, delegates to sidecar, and returns the gradient vector.
+// ComputeGradient receives current params, delegates to sidecar, and returns the
+// gradient vector, the shard's row count, and the regularized loss.
 func (w *Worker) ComputeGradient(args *ComputeGradientArgs, reply *ComputeGradientReply) error {
-	gradients, rowCount, err := w.requestGradients(args.Params)
+	gradients, rowCount, loss, err := w.requestGradients(args.Params)
 	if err != nil {
 		return fmt.Errorf("sidecar gradient error: %w", err)
 	}
 	reply.Gradients = gradients
 	reply.RowCount = rowCount
+	reply.Loss = loss
 	return nil
 }
 
@@ -221,31 +227,32 @@ type gradientRequest struct {
 type gradientResponse struct {
 	Gradients []float64 `json:"gradients"`
 	RowCount  int       `json:"row_count"`
+	Loss      float64   `json:"loss"`
 }
 
-func (w *Worker) requestGradients(params paramserver.Params) ([]float64, int, error) {
+func (w *Worker) requestGradients(params paramserver.Params) ([]float64, int, float64, error) {
 	req := gradientRequest{
 		Weights: reshapeWeights(params.Weights),
 		Bias:    params.Bias,
 	}
 	body, err := json.Marshal(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	resp, err := http.Post(w.sidecarAddr+"/gradient", "application/json", bytes.NewReader(body))
 	if err != nil || resp.StatusCode != 200 {
-		return nil, 0, fmt.Errorf("sidecar unavailable on node %d", w.nodeID)
+		return nil, 0, 0, fmt.Errorf("sidecar unavailable on node %d", w.nodeID)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	var gr gradientResponse
 	if err := json.Unmarshal(data, &gr); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return gr.Gradients, gr.RowCount, nil
+	return gr.Gradients, gr.RowCount, gr.Loss, nil
 }
 
 type evaluateRequest struct {

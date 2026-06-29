@@ -40,9 +40,15 @@ const (
 	LearningRate = 0.01
 )
 
+// Convergence. MaxEpochs is the hard cap fallback; the primary stop is a loss
+// plateau — training ends once the averaged regularized loss fails to improve by
+// more than MinLossDelta for Patience consecutive epochs. L2Lambda is the weight-
+// decay coefficient applied in the sidecar gradient; keep it in sync with sidecar.py.
 const (
-	MaxEpochs            = 2000
-	ConvergenceThreshold = 0.01
+	MaxEpochs    = 2000
+	L2Lambda     = 0.01
+	MinLossDelta = 0.005
+	Patience     = 50
 )
 
 const WorkerPort = ":8085"
@@ -61,6 +67,11 @@ const RecoveryTimeout = 10
 
 const CheckpointInterval = 5
 const GradientTimeout = 5
+
+// EpochPaceMillis throttles the coordinator epoch loop. Without pacing the loop
+// spins fast enough that the per-RPC rpc.Dial exhausts ephemeral ports. It also
+// caps wasted CPU on a fast local simulation.
+const EpochPaceMillis = 50
 
 const (
 	SyncSGD = "sync"
