@@ -382,7 +382,7 @@ func (c *Coordinator) epochLoop() {
 		c.mu.Unlock()
 
 		start := time.Now()
-		c.postCheckpoint(epoch, "started", 0.0)
+		c.postCheckpoint(epoch, "started", 0.0, 0.0)
 
 		params, err := c.fetchParams()
 		// if failed to fetch params, invoke param recovery path
@@ -429,7 +429,7 @@ func (c *Coordinator) epochLoop() {
 		}
 
 		accuracy := c.evaluateAccuracy()
-		c.postCheckpoint(epoch, "complete", accuracy)
+		c.postCheckpoint(epoch, "complete", accuracy, avgLoss)
 
 		c.mu.Lock()
 		c.lastCheckpoint = c.currentEpoch
@@ -449,7 +449,7 @@ func (c *Coordinator) epochLoop() {
 			if patienceCounter >= config.Patience {
 				log.Printf("coordinator: converged at epoch %d — loss plateaued at %.6f for %d epochs, accuracy %.1f%%",
 					epoch, bestLoss, patienceCounter, accuracy*100)
-				c.postCheckpoint(epoch, "converged", accuracy)
+				c.postCheckpoint(epoch, "converged", accuracy, avgLoss)
 				return
 			}
 		}
@@ -457,7 +457,7 @@ func (c *Coordinator) epochLoop() {
 		// Hard cap fallback.
 		if epoch+1 >= config.MaxEpochs {
 			log.Printf("coordinator: max epochs (%d) reached — final accuracy %.1f%%", config.MaxEpochs, accuracy*100)
-			c.postCheckpoint(epoch, "max_epochs_reached", accuracy)
+			c.postCheckpoint(epoch, "max_epochs_reached", accuracy, avgLoss)
 			return
 		}
 	}
@@ -853,16 +853,17 @@ type checkpointPost struct {
 	Epoch    int     `json:"epoch"`
 	Status   string  `json:"status"`
 	Accuracy float64 `json:"accuracy"`
+	Loss     float64 `json:"loss"`
 }
 
 var monitorClient = &http.Client{Timeout: 200 * time.Millisecond}
 
 // postCheckpoint posts epoch status to the monitor; non-fatal on failure.
-func (c *Coordinator) postCheckpoint(epoch int, status string, accuracy float64) {
+func (c *Coordinator) postCheckpoint(epoch int, status string, accuracy, loss float64) {
 	if !config.MonitorEnabled {
 		return
 	}
-	body, _ := json.Marshal(checkpointPost{epoch, status, accuracy})
+	body, _ := json.Marshal(checkpointPost{epoch, status, accuracy, loss})
 	resp, err := monitorClient.Post("http://"+config.MonitorAddr+"/checkpoint", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("coordinator: monitor unreachable (%v)", err)
