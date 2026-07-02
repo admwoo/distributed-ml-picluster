@@ -220,8 +220,7 @@ func (w *Worker) loadShard(rows []datastore.Row) {
 }
 
 type gradientRequest struct {
-	Weights [][]float64 `json:"weights"`
-	Bias    []float64   `json:"bias"`
+	Params []float64 `json:"params"`
 }
 
 type gradientResponse struct {
@@ -231,10 +230,7 @@ type gradientResponse struct {
 }
 
 func (w *Worker) requestGradients(params paramserver.Params) ([]float64, int, float64, error) {
-	req := gradientRequest{
-		Weights: reshapeWeights(params.Weights),
-		Bias:    params.Bias,
-	}
+	req := gradientRequest{Params: params.Weights}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, 0, 0, err
@@ -256,8 +252,7 @@ func (w *Worker) requestGradients(params paramserver.Params) ([]float64, int, fl
 }
 
 type evaluateRequest struct {
-	Weights [][]float64 `json:"weights"`
-	Bias    []float64   `json:"bias"`
+	Params []float64 `json:"params"`
 }
 
 type evaluateResponse struct {
@@ -266,10 +261,7 @@ type evaluateResponse struct {
 }
 
 func (w *Worker) requestEvaluation(params paramserver.Params) (int, int, error) {
-	req := evaluateRequest{
-		Weights: reshapeWeights(params.Weights),
-		Bias:    params.Bias,
-	}
+	req := evaluateRequest{Params: params.Weights}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return 0, 0, err
@@ -305,16 +297,6 @@ func (w *Worker) reloadShard(rows []datastore.Row) error {
 		return fmt.Errorf("sidecar reload_shard failed on node %d", w.nodeID)
 	}
 	return nil
-}
-
-// reshapeWeights converts a flat weight vector into a [NumClasses][NumFeatures] matrix.
-func reshapeWeights(flat []float64) [][]float64 {
-	matrix := make([][]float64, config.NumClasses)
-	for i := range matrix {
-		start := i * config.NumFeatures
-		matrix[i] = flat[start : start+config.NumFeatures]
-	}
-	return matrix
 }
 
 // --- Helpers ---

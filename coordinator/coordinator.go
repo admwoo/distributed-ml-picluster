@@ -547,14 +547,14 @@ func (c *Coordinator) fetchParams() (paramserver.Params, error) {
 	reply := paramserver.ReadParamsReply{}
 	// Try primary param server first
 	if call(paramPeers[primID], "ParamServer.ReadParams", &args, &reply) {
-		return initParams(reply.Params), nil
+		return c.initParams(reply.Params)
 	}
 
 	// plan B, fall back to the backup param server
 	args = paramserver.ReadParamsArgs{}
 	reply = paramserver.ReadParamsReply{}
 	if call(paramPeers[backID], "ParamServer.ReadParams", &args, &reply) {
-		return initParams(reply.Params), nil
+		return c.initParams(reply.Params)
 	}
 
 	// plan C, fall back to params saved on disk from any peer
@@ -562,43 +562,45 @@ func (c *Coordinator) fetchParams() (paramserver.Params, error) {
 	cpReply := paramserver.LoadCheckpointReply{}
 	for _, peer := range paramPeers {
 		if call(peer, "ParamServer.LoadCheckpoint", &cpArgs, &cpReply) {
-			return initParams(cpReply.Params), nil
+			return c.initParams(cpReply.Params)
 		}
 	}
 
 	return paramserver.Params{}, fmt.Errorf("fetchParams: all param sources failed")
 }
 
-// initParams returns p unchanged if it has weights; otherwise returns zero-initialized params.
-func initParams(p paramserver.Params) paramserver.Params {
+// initParams returns p unchanged if it already holds params; otherwise it seeds the
+// cluster from the coordinator's local sidecar (/init_params). A neural net must start
+// from a proper random init, not zeros, so the sidecar owns initialization and the
+// coordinator distributes that single starting point to every worker.
+func (c *Coordinator) initParams(p paramserver.Params) (paramserver.Params, error) {
 	if len(p.Weights) > 0 {
-		return p
+		return p, nil
 	}
-	return paramserver.Params{
-		Weights: make([]float64, config.NumFeatures*config.NumClasses),
-		Bias:    make([]float64, config.NumClasses),
+	flat, err := c.fetchInitParams()
+	if err != nil {
+		return paramserver.Params{}, fmt.Errorf("seed init params from sidecar: %w", err)
 	}
+	return paramserver.Params{Weights: flat}, nil
 }
 
-// writeParams applies an SGD update using old params and the averaged gradient, then writes to primary.
+// writeParams applies generic element-wise SGD over the whole flat param vector and
+// writes the result to the primary. The vector is opaque here — the sidecar owns its
+// layout — so there is no weights/bias split.
 func (c *Coordinator) writeParams(old paramserver.Params, gradients []float64) error {
-	weightGrads := gradients[:config.NumFeatures*config.NumClasses]
-	biasGrads := gradients[config.NumFeatures*config.NumClasses:]
-
+	if len(gradients) != len(old.Weights) {
+		return fmt.Errorf("writeParams: gradient length %d != param length %d", len(gradients), len(old.Weights))
+	}
 	newWeights := make([]float64, len(old.Weights))
 	for i := range newWeights {
-		newWeights[i] = old.Weights[i] - config.LearningRate*weightGrads[i]
-	}
-	newBias := make([]float64, len(old.Bias))
-	for i := range newBias {
-		newBias[i] = old.Bias[i] - config.LearningRate*biasGrads[i]
+		newWeights[i] = old.Weights[i] - config.LearningRate*gradients[i]
 	}
 
 	c.mu.Lock()
 	primID := c.paramPrimaryID
 	c.mu.Unlock()
 
-	wArgs := paramserver.WriteParamsArgs{Params: paramserver.Params{Weights: newWeights, Bias: newBias}}
+	wArgs := paramserver.WriteParamsArgs{Params: paramserver.Params{Weights: newWeights}}
 	wReply := paramserver.WriteParamsReply{}
 	if !call(c.paramPeers[primID], "ParamServer.WriteParams", &wArgs, &wReply) {
 		return fmt.Errorf("writeParams: RPC to primary failed")
@@ -656,10 +658,7 @@ func (c *Coordinator) evaluateAccuracy() float64 {
 }
 
 func (c *Coordinator) callSidecarEvaluate(params paramserver.Params) (int, int, error) {
-	req := sidecarGradientReq{
-		Weights: reshapeWeights(params.Weights),
-		Bias:    params.Bias,
-	}
+	req := sidecarGradientReq{Params: params.Weights}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return 0, 0, err
@@ -781,8 +780,11 @@ func (c *Coordinator) runWorkerRecovery(failedIDs []int) bool {
 // --- Sidecar communication ---
 
 type sidecarGradientReq struct {
-	Weights [][]float64 `json:"weights"`
-	Bias    []float64   `json:"bias"`
+	Params []float64 `json:"params"`
+}
+
+type sidecarInitResp struct {
+	Params []float64 `json:"params"`
 }
 
 type sidecarGradientResp struct {
@@ -802,10 +804,7 @@ type workerEvaluateReply struct{ Correct, Total int }
 // callSidecar posts params to the coordinator's local sidecar and returns the gradient
 // vector, row count, and regularized loss.
 func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, int, float64, error) {
-	req := sidecarGradientReq{
-		Weights: reshapeWeights(params.Weights),
-		Bias:    params.Bias,
-	}
+	req := sidecarGradientReq{Params: params.Weights}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, 0, 0, err
@@ -826,14 +825,26 @@ func (c *Coordinator) callSidecar(params paramserver.Params) ([]float64, int, fl
 	return gr.Gradients, gr.RowCount, gr.Loss, nil
 }
 
-// reshapeWeights converts a flat weight vector into a [NumClasses][NumFeatures] matrix.
-func reshapeWeights(flat []float64) [][]float64 {
-	matrix := make([][]float64, config.NumClasses)
-	for i := range matrix {
-		start := i * config.NumFeatures
-		matrix[i] = flat[start : start+config.NumFeatures]
+// fetchInitParams asks the coordinator's local sidecar for a freshly initialized flat
+// param vector. This is the single random-init source distributed to the whole cluster.
+func (c *Coordinator) fetchInitParams() ([]float64, error) {
+	resp, err := http.Get(c.sidecarAddr + "/init_params")
+	if err != nil || resp.StatusCode != 200 {
+		return nil, fmt.Errorf("sidecar /init_params unavailable on coordinator node %d", c.me)
 	}
-	return matrix
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var ir sidecarInitResp
+	if err := json.Unmarshal(data, &ir); err != nil {
+		return nil, err
+	}
+	if len(ir.Params) == 0 {
+		return nil, fmt.Errorf("sidecar /init_params returned empty params")
+	}
+	return ir.Params, nil
 }
 
 // --- Monitor communication ---

@@ -152,23 +152,21 @@ func TestParamRecovery(t *testing.T) {
 }
 
 func TestInitParams(t *testing.T) {
-	p := initParams(paramserver.Params{})
-	if len(p.Weights) != config.NumFeatures*config.NumClasses {
-		t.Errorf("weights len = %d, want %d", len(p.Weights), config.NumFeatures*config.NumClasses)
+	c := &Coordinator{sidecarAddr: "http://127.0.0.1:59999"} // nothing listening here
+
+	// non-empty params pass through unchanged
+	full := paramserver.Params{Weights: []float64{1.0, 2.0, 3.0}}
+	got, err := c.initParams(full)
+	if err != nil {
+		t.Fatalf("unexpected error on non-empty params: %v", err)
 	}
-	if len(p.Bias) != config.NumClasses {
-		t.Errorf("bias len = %d, want %d", len(p.Bias), config.NumClasses)
-	}
-	for _, w := range p.Weights {
-		if w != 0 {
-			t.Error("zero-initialized weights should all be 0")
-		}
+	if len(got.Weights) != 3 || got.Weights[0] != 1.0 {
+		t.Errorf("non-empty params modified: %+v", got)
 	}
 
-	full := paramserver.Params{Weights: []float64{1.0, 2.0}, Bias: []float64{3.0}}
-	got := initParams(full)
-	if got.Weights[0] != 1.0 || got.Bias[0] != 3.0 {
-		t.Errorf("non-empty params modified: %+v", got)
+	// empty params with no reachable sidecar to seed from -> error
+	if _, err := c.initParams(paramserver.Params{}); err == nil {
+		t.Error("expected error seeding init params with no sidecar, got nil")
 	}
 }
 
@@ -258,11 +256,20 @@ func startFakeWorker(t *testing.T, addr string, gradient []float64) net.Listener
 	return l
 }
 
-// fakeSidecar returns an httptest.Server that mimics the Flask sidecar's /gradient endpoint.
+// fakeSidecar mimics the Flask sidecar's flat-param endpoints: /init_params seeds a
+// zero vector the size of the gradient, /gradient returns the fixed gradient, and
+// /evaluate returns fixed counts.
 func fakeSidecar(t *testing.T, gradient []float64) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]any{"gradients": gradient, "row_count": 50})
+		switch r.URL.Path {
+		case "/init_params":
+			json.NewEncoder(w).Encode(map[string]any{"params": make([]float64, len(gradient))})
+		case "/evaluate":
+			json.NewEncoder(w).Encode(map[string]any{"correct": 40, "total": 50})
+		default: // /gradient
+			json.NewEncoder(w).Encode(map[string]any{"gradients": gradient, "row_count": 50, "loss": 0.5})
+		}
 	}))
 	return ts
 }
@@ -274,8 +281,10 @@ func TestEpochLoopHappyPath(t *testing.T) {
 	const n = 3
 	dir := t.TempDir()
 
-	// fixed gradient: 0.1 per element, length ParamSize
-	grad := make([]float64, config.ParamSize)
+	// fixed gradient: 0.1 per element. Length is arbitrary now that params are an
+	// opaque flat vector — it just has to match across init/gradient/SGD.
+	const paramSize = 15
+	grad := make([]float64, paramSize)
 	for i := range grad {
 		grad[i] = 0.1
 	}

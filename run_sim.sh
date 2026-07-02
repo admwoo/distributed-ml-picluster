@@ -9,6 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 N="${1:-3}"
+# The active sidecar. sidecar_torch.py speaks the flat-param protocol the Go layer
+# now uses; the older numpy sidecar.py is kept for reference but is NOT compatible.
+SIDECAR="worker/sidecar_torch.py"
 source .venv/bin/activate
 
 PIDS=()
@@ -25,13 +28,14 @@ PIDS+=($!)
 
 for i in $(seq 0 $((N - 1))); do
   port=$((15000 + i))
-  echo "run_sim: starting sidecar $i on port $port"
-  python3 worker/sidecar.py --port "$port" >"/tmp/picluster_sidecar_$i.log" 2>&1 &
+  echo "run_sim: starting sidecar $i ($SIDECAR) on port $port"
+  python3 "$SIDECAR" --port "$port" >"/tmp/picluster_sidecar_$i.log" 2>&1 &
   PIDS+=($!)
 done
 
 # give the Flask servers a moment to bind before the workers probe them
-sleep 2
+# (torch import makes sidecar_torch.py slower to come up than the numpy one)
+sleep 6
 
 echo "run_sim: starting $N-node simulation (Ctrl+C to stop)"
 echo "run_sim: dashboard -> http://127.0.0.1:8084 | logs -> /tmp/picluster_*.log"

@@ -32,13 +32,9 @@ var ClusterNodes = []string {
 var MonitorAddr = "10.0.0.60:8084"
 var MonitorEnabled = false
 
-// model shape — Iris dataset defaults
-const (
-	NumFeatures = 4
-	NumClasses  = 3
-	ParamSize   = NumFeatures*NumClasses + NumClasses // 15
-	LearningRate = 0.01
-)
+// Model shape now lives entirely in the sidecar (sidecar_torch.py) — the coordinator
+// treats params as one opaque flat vector, so NumFeatures/NumClasses/ParamSize are gone.
+const LearningRate = 0.01
 
 // Convergence. MaxEpochs is the hard cap fallback; the primary stop is a loss
 // plateau — training ends once the averaged regularized loss fails to improve by
