@@ -44,17 +44,21 @@ func sidecarAddr(nodeID int) string {
 }
 
 func main() {
-	csvPath := flag.String("data", "", "path to Iris CSV file (required)")
+	csvPath := flag.String("data", "", "path to a whole CSV (e.g. iris), sharded round-robin at load")
+	shards  := flag.String("shards", "", "dir of pre-split <prefix>_shard_<i>.csv files (e.g. MNIST); overrides -data")
+	prefix  := flag.String("prefix", "mnist", "shard-file prefix when using -shards")
 	n       := flag.Int("n", 3, "number of nodes to simulate")
 	monitor := flag.Bool("monitor", true, "push epoch checkpoints to a local monitor on 127.0.0.1:8084")
 	flag.Parse()
 
-	if *csvPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: simulation -data <iris.csv> [-n <nodes>] [-monitor=false]")
+	if *csvPath == "" && *shards == "" {
+		fmt.Fprintln(os.Stderr, "usage: simulation (-data <whole.csv> | -shards <dir>) [-n <nodes>] [-monitor=false]")
 		os.Exit(1)
 	}
-	if _, err := os.Stat(*csvPath); err != nil {
-		log.Fatalf("simulation: cannot read data file %q: %v", *csvPath, err)
+	if *shards == "" {
+		if _, err := os.Stat(*csvPath); err != nil {
+			log.Fatalf("simulation: cannot read data file %q: %v", *csvPath, err)
+		}
 	}
 
 	// Repoint the monitor at localhost for the simulation; the Pi build keeps the
@@ -70,7 +74,7 @@ func main() {
 	log.Printf("simulation: starting %d-node cluster", *n)
 	log.Println("simulation: start sidecars in separate terminals BEFORE running this:")
 	for i := range *n {
-		log.Printf("  node %d:  python3 worker/sidecar.py --port %d", i, 15000+i)
+		log.Printf("  node %d:  python3 worker/sidecar_torch.py --port %d", i, 15000+i)
 	}
 	if *monitor {
 		log.Println("simulation: start the monitor in a separate terminal, then open http://127.0.0.1:8084 :")
@@ -78,12 +82,21 @@ func main() {
 	}
 	log.Println()
 
+	// A pre-split shard dir (-shards) uses one file per node; otherwise a whole CSV
+	// (-data) is sharded round-robin at load time.
+	newLoader := func() datastore.ShardLoader {
+		if *shards != "" {
+			return &datastore.CSVShardLoader{Dir: *shards, Prefix: *prefix}
+		}
+		return &datastore.WholeCSVLoader{Path: *csvPath, NumNodes: *n}
+	}
+
 	// param servers and datastores start synchronously — workers depend on them.
 	// Keep the param-server handles so the kill command can take one down at runtime.
 	paramServers := make([]*paramserver.ParamServer, *n)
 	for i := range *n {
 		paramServers[i] = paramserver.Make(paramPeers[i], fmt.Sprintf("%s/param_%d.json", checkpointDir, i))
-		datastore.Make(i, dataPeers, *csvPath, datastore.DefaultVNodes)
+		datastore.Make(i, dataPeers, newLoader(), datastore.DefaultVNodes)
 	}
 
 	// coordinators start their election in a background goroutine internally

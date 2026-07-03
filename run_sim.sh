@@ -37,6 +37,11 @@ done
 # (torch import makes sidecar_torch.py slower to come up than the numpy one)
 sleep 6
 
+if [ ! -f "data/mnist_shard_0.csv" ]; then
+  echo "run_sim: MNIST shards missing — run: python3 prepare_mnist.py --nodes $N" >&2
+  exit 1
+fi
+
 echo "run_sim: starting $N-node simulation (Ctrl+C to stop)"
 echo "run_sim: dashboard -> http://127.0.0.1:8084 | logs -> /tmp/picluster_*.log"
-go run ./simulation -data data/iris.csv -n "$N"
+go run ./simulation -shards data -prefix mnist -n "$N"

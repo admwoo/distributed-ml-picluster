@@ -56,26 +56,65 @@ type ActivateReplicaReply struct{}
 type GetRescuedShardArgs struct{}
 type GetRescuedShardReply struct{ Rows []Row }
 
+// --- Shard loading ---
+
+// ShardLoader abstracts how a node obtains its shard of rows, decoupling the
+// datastore from the data source. Pre-split files today, a live streaming feed
+// later — swapping is just a new implementation; replication and the RPC layer
+// above are unaffected.
+type ShardLoader interface {
+	LoadShard(nodeID int) ([]Row, error)
+}
+
+// CSVShardLoader reads one pre-split file per node: <Dir>/<Prefix>_shard_<nodeID>.csv.
+// Each node loads only its own shard — no full-dataset load (used for MNIST).
+type CSVShardLoader struct {
+	Dir    string
+	Prefix string
+}
+
+func (l *CSVShardLoader) LoadShard(nodeID int) ([]Row, error) {
+	return loadCSV(fmt.Sprintf("%s/%s_shard_%d.csv", l.Dir, l.Prefix, nodeID))
+}
+
+// WholeCSVLoader loads a single CSV and returns this node's round-robin slice,
+// reusing ownerOf so the partition rule stays single-sourced. Preserves the
+// original single-file behavior (iris).
+type WholeCSVLoader struct {
+	Path     string
+	NumNodes int
+}
+
+func (l *WholeCSVLoader) LoadShard(nodeID int) ([]Row, error) {
+	all, err := loadCSV(l.Path)
+	if err != nil {
+		return nil, err
+	}
+	var shard []Row
+	for i, row := range all {
+		if ownerOf(i, l.NumNodes) == nodeID {
+			shard = append(shard, row)
+		}
+	}
+	return shard, nil
+}
+
 // --- Lifecycle ---
 
-// Make loads the dataset, builds the hash ring, and pushes this node's shard to its right neighbor.
-func Make(nodeID int, peers []string, dataPath string, vnodes int) *DataStore {
+// Make loads this node's shard via the loader, builds the hash ring, and pushes the
+// shard to its right neighbor for replication.
+func Make(nodeID int, peers []string, loader ShardLoader, vnodes int) *DataStore {
 	ds := &DataStore{}
 	ds.nodeID = nodeID
 	ds.peers = peers
 	ds.vnodes = vnodes
 	ds.ring = ds.buildRing()
 
-	allRows, err := loadCSV(dataPath)
+	shard, err := loader.LoadShard(nodeID)
 	if err != nil {
-		log.Fatal("datastore: failed to load dataset: ", err)
+		log.Fatal("datastore: failed to load shard: ", err)
 	}
-
-	for i, row := range allRows {
-		if ds.ownerOf(i) == nodeID {
-			ds.primaryShard = append(ds.primaryShard, row)
-		}
-	}
+	ds.primaryShard = shard
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(ds)
@@ -96,7 +135,7 @@ func Make(nodeID int, peers []string, dataPath string, vnodes int) *DataStore {
 		}
 	}()
 
-	log.Printf("datastore: node %d loaded %d primary rows from %d total", nodeID, len(ds.primaryShard), len(allRows))
+	log.Printf("datastore: node %d loaded %d primary rows", nodeID, len(ds.primaryShard))
 
 	rightNeighbor := (nodeID + 1) % len(peers)
 	args := ReceiveReplicaArgs{Rows: ds.primaryShard}
@@ -132,10 +171,10 @@ func (ds *DataStore) buildRing() []RingEntry {
 }
 
 // ownerOf returns the physical node responsible for the given row index.
-// Round-robin guarantees even distribution regardless of cluster size.
-// The consistent-hashing ring is kept for recovery and rebalancing operations.
-func (ds *DataStore) ownerOf(rowIndex int) int {
-	return rowIndex % len(ds.peers)
+// Round-robin guarantees even distribution regardless of cluster size. It's a free
+// function so WholeCSVLoader (not a *DataStore) can share the one partition rule.
+func ownerOf(rowIndex, numNodes int) int {
+	return rowIndex % numNodes
 }
 
 // fnv32 hashes a string to a uint32 ring position.
@@ -161,8 +200,9 @@ func loadCSV(path string) ([]Row, error) {
 		return nil, err
 	}
 
-	// Iris label map
-	irisLabelMap := map[string]int {
+	// Labels are integers (MNIST 0-9); fall back to the iris string map for the
+	// legacy iris CSV whose last column is a class name.
+	irisLabelMap := map[string]int{
 		"setosa": 0, "versicolor": 1, "virginica": 2,
 	}
 
@@ -174,9 +214,11 @@ func loadCSV(path string) ([]Row, error) {
 			if err != nil { continue }
 			row.Features = append(row.Features, f)
 		}
-		label, ok := irisLabelMap[record[len(record)-1]]
-		if ok {
-			row.Label = label
+		labelStr := record[len(record)-1]
+		if v, err := strconv.Atoi(labelStr); err == nil {
+			row.Label = v
+		} else if v, ok := irisLabelMap[labelStr]; ok {
+			row.Label = v
 		}
 		rows = append(rows, row)
 	}

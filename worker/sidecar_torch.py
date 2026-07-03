@@ -26,10 +26,10 @@ import torch.nn as nn
 
 # --- Architecture. Keep INPUT_DIM/NUM_CLASSES in sync with the dataset being served
 # (iris: 4/3, MNIST: 784/10). The coordinator stays agnostic to all of this. ---
-INPUT_DIM = 4
-HIDDEN1 = 16
-HIDDEN2 = 8
-NUM_CLASSES = 3
+INPUT_DIM = 784
+HIDDEN1 = 128
+HIDDEN2 = 64
+NUM_CLASSES = 10
 L2_LAMBDA = 0.01  # weight decay; applied to weight matrices only (not biases)
 
 

@@ -3,5 +3,8 @@
 
 *.log
 
+# generated MNIST shard files (regenerate with prepare_mnist.py)
+data/*_shard_*.csv
+
 .venv
 ARCHITECTURE.md

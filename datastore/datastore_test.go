@@ -95,7 +95,7 @@ func TestOwnerOfCoversAllNodes(t *testing.T) {
 
 	counts := make(map[int]int)
 	for i := range 150 {
-		owner := ds.ownerOf(i)
+		owner := ownerOf(i, len(testPeers))
 		counts[owner]++
 	}
 	for nodeID := range testPeers {
@@ -115,7 +115,7 @@ func TestRingReplication(t *testing.T) {
 	done := make(chan int, len(testPeers))
 	for i := range testPeers {
 		go func(id int) {
-			nodes[id] = Make(id, testPeers, path, DefaultVNodes)
+			nodes[id] = Make(id, testPeers, &WholeCSVLoader{Path: path, NumNodes: len(testPeers)}, DefaultVNodes)
 			done <- id
 		}(i)
 	}
